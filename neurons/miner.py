@@ -72,6 +72,10 @@ class Miner(BaseMinerNeuron):
         self._pending_lock = threading.Lock()
         self._pending_tasks = 0
         self._pending_rejections = 0
+        self._llm_stats_lock = threading.Lock()
+        self._llm_slot_acquires = 0
+        self._llm_slot_wait_events = 0
+        self._llm_slot_wait_time_seconds = 0.0
 
         # Redis distributed cache backend (shared across multiple miner processes on same server)
         self._redis_enabled = self._cache_backend == "redis" and redis_lib is not None
@@ -83,6 +87,12 @@ class Miner(BaseMinerNeuron):
         self._redis_lock_ttl_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_LOCK_TTL_SECONDS", 60.0))
         self._redis_wait_timeout_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_WAIT_TIMEOUT_SECONDS", 10.0))
         self._redis_wait_poll_interval_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_WAIT_POLL_INTERVAL_SECONDS", 0.2))
+        self._redis_wait_log_interval_seconds = float(
+            getattr(talisman_ai.config, "MINER_CACHE_WAIT_LOG_INTERVAL_SECONDS", 15.0)
+        )
+        self._redis_max_stale_wait_seconds = float(
+            getattr(talisman_ai.config, "MINER_CACHE_MAX_STALE_WAIT_SECONDS", 300.0)
+        )
         self._redis_lock_heartbeat_seconds = float(
             getattr(
                 talisman_ai.config,
@@ -90,6 +100,23 @@ class Miner(BaseMinerNeuron):
                 max(1.0, self._redis_lock_ttl_seconds / 3.0),
             )
         )
+        self._host_llm_max_concurrency = max(
+            0,
+            int(getattr(talisman_ai.config, "MINER_HOST_LLM_MAX_CONCURRENCY", 8)),
+        )
+        self._host_llm_slot_ttl_seconds = float(
+            getattr(talisman_ai.config, "MINER_HOST_LLM_SLOT_TTL_SECONDS", 90.0)
+        )
+        self._host_llm_slot_heartbeat_seconds = float(
+            getattr(talisman_ai.config, "MINER_HOST_LLM_SLOT_HEARTBEAT_SECONDS", 10.0)
+        )
+        self._host_llm_wait_poll_interval_seconds = float(
+            getattr(talisman_ai.config, "MINER_HOST_LLM_WAIT_POLL_INTERVAL_SECONDS", 0.2)
+        )
+        self._host_llm_wait_log_interval_seconds = float(
+            getattr(talisman_ai.config, "MINER_HOST_LLM_WAIT_LOG_INTERVAL_SECONDS", 15.0)
+        )
+        self._host_llm_local_semaphore = None
         self._cache_hits_redis = 0
         self._cache_misses_redis = 0
         self._cache_wait_hits_redis = 0
@@ -110,6 +137,13 @@ class Miner(BaseMinerNeuron):
                 bt.logging.warning(f"[Miner][Cache] Redis backend disabled (init failed): {e}")
                 self._redis_enabled = False
                 self._redis = None
+
+        if self._host_llm_max_concurrency > 0 and not self._redis_enabled:
+            self._host_llm_local_semaphore = threading.BoundedSemaphore(self._host_llm_max_concurrency)
+            bt.logging.warning(
+                f"[Miner][LLM] Redis unavailable; falling back to per-process semaphore "
+                f"(max_concurrency={self._host_llm_max_concurrency})"
+            )
 
         # IMPORTANT: Register a concrete TweetBatch handler on the axon.
         # Bittensor routes requests by synapse class name; attaching only `forward(self, bt.Synapse)`
@@ -207,6 +241,14 @@ class Miner(BaseMinerNeuron):
         except Exception:
             return None
 
+    def _redis_key_exists(self, key: str) -> bool:
+        if not self._redis_enabled or self._redis is None:
+            return False
+        try:
+            return bool(self._redis.exists(key))
+        except Exception:
+            return False
+
     def _redis_set_payload(self, data_key: str, payload: dict) -> None:
         if not self._redis_enabled or self._redis is None:
             return
@@ -230,10 +272,13 @@ class Miner(BaseMinerNeuron):
             return False
 
     def _redis_release_lock(self, lock_key: str, token: str) -> None:
+        self._redis_release_owned_key(lock_key, token)
+
+    def _redis_release_owned_key(self, key: str, token: str) -> None:
         if not self._redis_enabled or self._redis is None:
             return
         try:
-            # Release lock only if still owned (token matches)
+            # Release key only if still owned (token matches)
             lua = """
             if redis.call('get', KEYS[1]) == ARGV[1] then
                 return redis.call('del', KEYS[1])
@@ -246,10 +291,13 @@ class Miner(BaseMinerNeuron):
             pass
 
     def _redis_refresh_lock(self, lock_key: str, token: str) -> bool:
+        return self._redis_refresh_owned_key(lock_key, token, self._redis_lock_ttl_seconds)
+
+    def _redis_refresh_owned_key(self, key: str, token: str, ttl_seconds: float) -> bool:
         if not self._redis_enabled or self._redis is None:
             return False
         try:
-            ttl_ms = max(1000, int(self._redis_lock_ttl_seconds * 1000))
+            ttl_ms = max(1000, int(ttl_seconds * 1000))
             lua = """
             if redis.call('get', KEYS[1]) == ARGV[1] then
                 return redis.call('pexpire', KEYS[1], ARGV[2])
@@ -257,7 +305,7 @@ class Miner(BaseMinerNeuron):
                 return 0
             end
             """
-            result = self._redis.eval(lua, 1, lock_key, token, ttl_ms)
+            result = self._redis.eval(lua, 1, key, token, ttl_ms)
             return bool(result)
         except Exception:
             return False
@@ -278,6 +326,129 @@ class Miner(BaseMinerNeuron):
         )
         thread.start()
         return stop_event, thread
+
+    def _start_owned_key_heartbeat(
+        self,
+        key: str,
+        token: str,
+        ttl_seconds: float,
+        interval_seconds: float,
+        thread_name: str,
+    ):
+        stop_event = threading.Event()
+
+        def _heartbeat():
+            interval = max(0.25, interval_seconds)
+            while not stop_event.wait(interval):
+                if not self._redis_refresh_owned_key(key, token, ttl_seconds):
+                    break
+
+        thread = threading.Thread(
+            target=_heartbeat,
+            daemon=True,
+            name=thread_name,
+        )
+        thread.start()
+        return stop_event, thread
+
+    def _host_llm_slot_key(self, slot_index: int) -> str:
+        return f"{self._redis_namespace}:llm_slot:{slot_index}"
+
+    def _acquire_host_llm_slot(self, kind_label: str, validator_hotkey: str):
+        if self._host_llm_max_concurrency <= 0:
+            return None, None
+
+        start_wait = time.time()
+        if self._redis_enabled and self._redis is not None:
+            token = uuid.uuid4().hex
+            slot_count = max(1, self._host_llm_max_concurrency)
+            start_index = int(token[:8], 16) % slot_count
+            warned = False
+            while True:
+                for offset in range(slot_count):
+                    slot_index = (start_index + offset) % slot_count
+                    slot_key = self._host_llm_slot_key(slot_index)
+                    try:
+                        ttl_seconds = max(1, int(self._host_llm_slot_ttl_seconds))
+                        ok = self._redis.set(slot_key, token, nx=True, ex=ttl_seconds)
+                    except Exception:
+                        ok = False
+                    if ok:
+                        heartbeat = self._start_owned_key_heartbeat(
+                            slot_key,
+                            token,
+                            self._host_llm_slot_ttl_seconds,
+                            self._host_llm_slot_heartbeat_seconds,
+                            "miner_host_llm_slot_heartbeat",
+                        )
+                        wait_time = time.time() - start_wait
+                        with self._llm_stats_lock:
+                            self._llm_slot_acquires += 1
+                            if wait_time > 0.01:
+                                self._llm_slot_wait_events += 1
+                                self._llm_slot_wait_time_seconds += wait_time
+                        return ("redis", slot_key, token, heartbeat), wait_time
+                if not warned and (time.time() - start_wait) >= self._host_llm_wait_log_interval_seconds:
+                    bt.logging.warning(
+                        f"[Miner][LLM] Waiting for host slot kind={kind_label} "
+                        f"validator={validator_hotkey[:12]}.. limit={self._host_llm_max_concurrency}"
+                    )
+                    warned = True
+                time.sleep(self._host_llm_wait_poll_interval_seconds)
+
+        if self._host_llm_local_semaphore is None:
+            return None, 0.0
+
+        warned = False
+        while True:
+            if self._host_llm_local_semaphore.acquire(timeout=self._host_llm_wait_poll_interval_seconds):
+                wait_time = time.time() - start_wait
+                with self._llm_stats_lock:
+                    self._llm_slot_acquires += 1
+                    if wait_time > 0.01:
+                        self._llm_slot_wait_events += 1
+                        self._llm_slot_wait_time_seconds += wait_time
+                return ("local",), wait_time
+            if not warned and (time.time() - start_wait) >= self._host_llm_wait_log_interval_seconds:
+                bt.logging.warning(
+                    f"[Miner][LLM] Waiting for local slot kind={kind_label} "
+                    f"validator={validator_hotkey[:12]}.. limit={self._host_llm_max_concurrency}"
+                )
+                warned = True
+
+    def _release_host_llm_slot(self, slot_handle) -> None:
+        if slot_handle is None:
+            return
+        kind = slot_handle[0]
+        if kind == "redis":
+            _, slot_key, token, heartbeat = slot_handle
+            stop_event, thread = heartbeat
+            stop_event.set()
+            thread.join(timeout=1.0)
+            self._redis_release_owned_key(slot_key, token)
+            return
+        if kind == "local" and self._host_llm_local_semaphore is not None:
+            try:
+                self._host_llm_local_semaphore.release()
+            except ValueError:
+                pass
+
+    def _run_under_host_llm_limit(
+        self,
+        compute_fn: typing.Callable[[], dict],
+        kind_label: str,
+        validator_hotkey: str,
+    ) -> dict:
+        slot_handle, wait_time = self._acquire_host_llm_slot(kind_label, validator_hotkey)
+        if wait_time > 0.01:
+            bt.logging.info(
+                f"[Miner][LLM] Acquired host slot after {wait_time:.2f}s "
+                f"kind={kind_label} validator={validator_hotkey[:12]}.."
+            )
+        try:
+            return compute_fn()
+        finally:
+            self._release_host_llm_slot(slot_handle)
 
     def _distributed_get_or_compute(
         self,
@@ -306,60 +477,76 @@ class Miner(BaseMinerNeuron):
             self._cache_misses_redis += 1
 
         lock_key = self._redis_lock_key(data_key)
-        token = uuid.uuid4().hex
-        lock_acquired = self._redis_acquire_lock(lock_key, token)
-        if lock_acquired:
-            heartbeat_stop = None
-            heartbeat_thread = None
-            try:
-                heartbeat_stop, heartbeat_thread = self._start_lock_heartbeat(lock_key, token)
-                # Re-check after acquiring lock (another process may have filled it).
-                payload = self._redis_get_payload(data_key)
-                if payload is not None:
+        wait_started = time.time()
+        next_wait_log_at = wait_started + max(1.0, self._redis_wait_timeout_seconds)
+        stale_deadline = (
+            wait_started + self._redis_max_stale_wait_seconds
+            if self._redis_max_stale_wait_seconds > 0
+            else None
+        )
+
+        while True:
+            token = uuid.uuid4().hex
+            lock_acquired = self._redis_acquire_lock(lock_key, token)
+            if lock_acquired:
+                heartbeat_stop = None
+                heartbeat_thread = None
+                try:
+                    heartbeat_stop, heartbeat_thread = self._start_lock_heartbeat(lock_key, token)
+                    # Re-check after acquiring lock (another process may have filled it).
+                    payload = self._redis_get_payload(data_key)
+                    if payload is not None:
+                        with self._cache_lock:
+                            self._cache_hits_redis += 1
+                        bt.logging.info(
+                            f"[Miner][Cache][Redis] {kind_label} redis hit-after-lock validator={validator_hotkey[:12]}.."
+                        )
+                        return payload
+
+                    payload = compute_fn()
+                    self._redis_set_payload(data_key, payload)
                     with self._cache_lock:
-                        self._cache_hits_redis += 1
+                        self._cache_computed_redis += 1
                     bt.logging.info(
-                        f"[Miner][Cache][Redis] {kind_label} redis hit-after-lock validator={validator_hotkey[:12]}.."
+                        f"[Miner][Cache][Redis] {kind_label} computed by lock-holder validator={validator_hotkey[:12]}.."
                     )
                     return payload
+                finally:
+                    if heartbeat_stop is not None:
+                        heartbeat_stop.set()
+                    if heartbeat_thread is not None:
+                        heartbeat_thread.join(timeout=1.0)
+                    self._redis_release_lock(lock_key, token)
 
-                payload = compute_fn()
-                self._redis_set_payload(data_key, payload)
+            payload = self._redis_get_payload(data_key)
+            if payload is not None:
                 with self._cache_lock:
-                    self._cache_computed_redis += 1
+                    self._cache_wait_hits_redis += 1
                 bt.logging.info(
-                    f"[Miner][Cache][Redis] {kind_label} computed by lock-holder validator={validator_hotkey[:12]}.."
+                    f"[Miner][Cache][Redis] {kind_label} wait-hit validator={validator_hotkey[:12]}.."
                 )
                 return payload
-            finally:
-                if heartbeat_stop is not None:
-                    heartbeat_stop.set()
-                if heartbeat_thread is not None:
-                    heartbeat_thread.join(timeout=1.0)
-                self._redis_release_lock(lock_key, token)
-        else:
-            # Wait briefly for the lock holder to populate Redis.
-            deadline = time.time() + self._redis_wait_timeout_seconds
-            while time.time() < deadline:
-                payload = self._redis_get_payload(data_key)
-                if payload is not None:
-                    with self._cache_lock:
-                        self._cache_wait_hits_redis += 1
-                    bt.logging.info(
-                        f"[Miner][Cache][Redis] {kind_label} wait-hit validator={validator_hotkey[:12]}.."
-                    )
-                    return payload
-                time.sleep(self._redis_wait_poll_interval_seconds)
 
-            # Last resort: compute anyway to avoid long stalls.
-            payload = compute_fn()
-            self._redis_set_payload(data_key, payload)
-            with self._cache_lock:
-                self._cache_computed_redis += 1
-            bt.logging.info(
-                f"[Miner][Cache][Redis] {kind_label} computed after-wait-timeout validator={validator_hotkey[:12]}.."
-            )
-            return payload
+            owner_active = self._redis_key_exists(lock_key)
+            now = time.time()
+            if owner_active:
+                if now >= next_wait_log_at:
+                    bt.logging.info(
+                        f"[Miner][Cache][Redis] {kind_label} waiting-on-lock-holder "
+                        f"validator={validator_hotkey[:12]}.."
+                    )
+                    next_wait_log_at = now + max(1.0, self._redis_wait_log_interval_seconds)
+                if stale_deadline is not None and now >= stale_deadline:
+                    bt.logging.warning(
+                        f"[Miner][Cache][Redis] {kind_label} stale-wait exceeded "
+                        f"validator={validator_hotkey[:12]}.. continuing to wait for shared result"
+                    )
+                    stale_deadline = now + max(30.0, self._redis_max_stale_wait_seconds)
+                time.sleep(self._redis_wait_poll_interval_seconds)
+                continue
+
+            # No payload and no active owner lock; retry lock acquisition immediately.
+            time.sleep(self._redis_wait_poll_interval_seconds)
 
     def _get_or_compute_payload(
         self,
@@ -406,15 +593,21 @@ class Miner(BaseMinerNeuron):
                 owner_future.set_result(cached)
                 return cached
 
+            limited_compute_fn = lambda: self._run_under_host_llm_limit(
+                compute_fn,
+                kind_label=kind_label,
+                validator_hotkey=validator_hotkey,
+            )
+
             if self._redis_enabled:
                 payload = self._distributed_get_or_compute(
                     local_cache_key=cache_key,
-                    compute_fn=compute_fn,
+                    compute_fn=limited_compute_fn,
                     kind_label=kind_label,
                     validator_hotkey=validator_hotkey,
                 )
             else:
-                payload = compute_fn()
+                payload = limited_compute_fn()
             self._cache_set(local_cache, cache_key, payload)
             owner_future.set_result(payload)
             return payload
@@ -471,6 +664,10 @@ class Miner(BaseMinerNeuron):
             with self._pending_lock:
                 pending_tasks = int(self._pending_tasks)
                 pending_rejections = int(self._pending_rejections)
+            with self._llm_stats_lock:
+                llm_slot_acquires = int(self._llm_slot_acquires)
+                llm_slot_wait_events = int(self._llm_slot_wait_events)
+                llm_slot_wait_time_seconds = float(self._llm_slot_wait_time_seconds)
             self._cache_last_log_ts = now
 
         bt.logging.info(
@@ -479,7 +676,9 @@ class Miner(BaseMinerNeuron):
             f"telegram_cache={telegram_size} ttl_s={self._cache_ttl_seconds:.0f} "
             f"redis_hits={redis_hits} redis_misses={redis_misses} redis_wait_hits={redis_wait_hits} "
             f"redis_computed={redis_computed} inflight_joins={inflight_joins} "
-            f"pending_tasks={pending_tasks}/{self._max_pending_tasks} pending_rejections={pending_rejections}"
+            f"pending_tasks={pending_tasks}/{self._max_pending_tasks} pending_rejections={pending_rejections} "
+            f"llm_slot_acquires={llm_slot_acquires} llm_slot_waits={llm_slot_wait_events} "
+            f"llm_slot_wait_s={llm_slot_wait_time_seconds:.1f}"
         )
 
     async def blacklist_tweet_batch(

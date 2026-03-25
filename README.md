@@ -199,16 +199,23 @@ For multi-miner hosts using the shared Redis cache, tune these in `.miner_env`:
 
 - `MINER_WORKERS`: per-process analysis worker threads
 - `MINER_MAX_PENDING_TASKS`: hard cap on queued background jobs per process
+- `MINER_HOST_LLM_MAX_CONCURRENCY`: host-wide maximum concurrent LLM analyses across all miner processes
+- `MINER_HOST_LLM_SLOT_TTL_SECONDS`: lease TTL for a host-wide LLM slot
+- `MINER_HOST_LLM_SLOT_HEARTBEAT_SECONDS`: heartbeat interval for extending an active LLM slot lease
 - `MINER_CACHE_BACKEND=redis`: enables shared dedupe across miner processes
 - `MINER_CACHE_LOCK_TTL_SECONDS`: Redis lock TTL for in-flight shared work
-- `MINER_CACHE_WAIT_TIMEOUT_SECONDS`: how long other miners wait for the lock-holder result
+- `MINER_CACHE_WAIT_TIMEOUT_SECONDS`: delay before the first prolonged-wait log while another miner owns the shared work
+- `MINER_CACHE_WAIT_LOG_INTERVAL_SECONDS`: interval between prolonged-wait logs while waiting on a shared result
+- `MINER_CACHE_MAX_STALE_WAIT_SECONDS`: stale-wait warning threshold for extremely slow shared work
 - `MINER_CACHE_LOCK_HEARTBEAT_SECONDS`: interval for extending the Redis lock while analysis is still running
 
 Current miner behavior:
 
 - De-duplicates identical tweet / telegram analyses inside each miner process
 - De-duplicates identical analyses across multiple miner processes on the same Redis namespace
+- Enforces a host-wide LLM concurrency ceiling across miner processes when Redis is enabled
 - Uses one LLM classification call per item instead of multiple category-specific calls
+- Keeps waiters blocked on the live lock-holder instead of recomputing after a short timeout
 - Rejects new background work once the local pending queue reaches `MINER_MAX_PENDING_TASKS`
 
 **Run Validator**
