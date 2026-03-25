@@ -145,8 +145,9 @@ class Miner(BaseMinerNeuron):
             self._cache_last_log_ts = now
 
         bt.logging.info(
-            "[Miner][CacheStats] hits=%d misses=%d hit_rate=%.2f%% tweet_cache=%d telegram_cache=%d ttl_s=%.0f",
-            hits, misses, hit_rate, tweet_size, telegram_size, self._cache_ttl_seconds
+            f"[Miner][CacheStats] hits={hits} misses={misses} "
+            f"hit_rate={hit_rate:.2f}% tweet_cache={tweet_size} "
+            f"telegram_cache={telegram_size} ttl_s={self._cache_ttl_seconds:.0f}"
         )
 
     async def blacklist_tweet_batch(
