@@ -222,31 +222,57 @@ class Miner(BaseMinerNeuron):
             validator_axon = self.metagraph.axons[validator_uid]
             bt.logging.info(f"[Miner] Background: Found validator UID {validator_uid}, sending response via dendrite")
             
-            # Send the processed batch back to the validator
+            # Send the processed batch back to the validator.
+            push_timeout = float(getattr(talisman_ai.config, "MINER_PUSH_TIMEOUT", 90.0))
+            max_retries = max(0, int(getattr(talisman_ai.config, "MINER_PUSH_RETRIES", 1)))
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             dendrite = None
             try:
-                dendrite = bt.Dendrite(wallet=self.wallet)
-                responses = loop.run_until_complete(
-                    dendrite.forward(
-                        axons=[validator_axon],
-                        synapse=synapse,
-                        timeout=30.0,
-                        deserialize=True,
+                for attempt in range(max_retries + 1):
+                    if dendrite is not None:
+                        try:
+                            if hasattr(dendrite, "aclose_session"):
+                                loop.run_until_complete(dendrite.aclose_session())
+                            elif hasattr(dendrite, "close_session"):
+                                dendrite.close_session()
+                        except Exception:
+                            pass
+                        dendrite = None
+                    dendrite = bt.Dendrite(wallet=self.wallet)
+                    responses = loop.run_until_complete(
+                        dendrite.forward(
+                            axons=[validator_axon],
+                            synapse=synapse,
+                            timeout=push_timeout,
+                            deserialize=True,
+                        )
                     )
-                )
-                try:
-                    status_code = responses[0].dendrite.status_code if responses and responses[0].dendrite else None
-                    status_msg = responses[0].dendrite.status_message if responses and responses[0].dendrite else None
-                except Exception:
-                    status_code, status_msg = None, None
-                if status_code != 200:
-                    bt.logging.error(f"[Miner] Background: Validator response failed (status={status_code}): {status_msg}")
-                else:
-                    bt.logging.info(
-                        f"[Miner] Background: Successfully sent processed TweetBatch back to validator {validator_hotkey}"
+                    try:
+                        status_code = responses[0].dendrite.status_code if responses and responses[0].dendrite else None
+                        status_msg = responses[0].dendrite.status_message if responses and responses[0].dendrite else None
+                    except Exception:
+                        status_code, status_msg = None, None
+
+                    if status_code == 200:
+                        bt.logging.info(
+                            f"[Miner] Background: Successfully sent processed TweetBatch back to validator {validator_hotkey}"
+                        )
+                        break
+
+                    retryable = status_code in (408, 429, 500, 502, 503, 504) or status_code is None
+                    if retryable and attempt < max_retries:
+                        bt.logging.warning(
+                            f"[Miner] Background: TweetBatch push failed (status={status_code}): {status_msg}; "
+                            f"retrying {attempt + 1}/{max_retries} after backoff"
+                        )
+                        time.sleep(2.0 * (attempt + 1))
+                        continue
+
+                    bt.logging.error(
+                        f"[Miner] Background: Validator response failed (status={status_code}): {status_msg}"
                     )
+                    break
             except Exception as e:
                 bt.logging.error(f"[Miner] Background: Failed to send response to validator: {e}")
             finally:
@@ -354,31 +380,57 @@ class Miner(BaseMinerNeuron):
             validator_axon = self.metagraph.axons[validator_uid]
             bt.logging.info(f"[Miner] Background: Found validator UID {validator_uid}, sending telegram response via dendrite")
             
-            # Send the processed batch back to the validator
+            # Send the processed batch back to the validator.
+            push_timeout = float(getattr(talisman_ai.config, "MINER_PUSH_TIMEOUT", 90.0))
+            max_retries = max(0, int(getattr(talisman_ai.config, "MINER_PUSH_RETRIES", 1)))
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             dendrite = None
             try:
-                dendrite = bt.Dendrite(wallet=self.wallet)
-                responses = loop.run_until_complete(
-                    dendrite.forward(
-                        axons=[validator_axon],
-                        synapse=synapse,
-                        timeout=30.0,
-                        deserialize=True,
+                for attempt in range(max_retries + 1):
+                    if dendrite is not None:
+                        try:
+                            if hasattr(dendrite, "aclose_session"):
+                                loop.run_until_complete(dendrite.aclose_session())
+                            elif hasattr(dendrite, "close_session"):
+                                dendrite.close_session()
+                        except Exception:
+                            pass
+                        dendrite = None
+                    dendrite = bt.Dendrite(wallet=self.wallet)
+                    responses = loop.run_until_complete(
+                        dendrite.forward(
+                            axons=[validator_axon],
+                            synapse=synapse,
+                            timeout=push_timeout,
+                            deserialize=True,
+                        )
                     )
-                )
-                try:
-                    status_code = responses[0].dendrite.status_code if responses and responses[0].dendrite else None
-                    status_msg = responses[0].dendrite.status_message if responses and responses[0].dendrite else None
-                except Exception:
-                    status_code, status_msg = None, None
-                if status_code != 200:
-                    bt.logging.error(f"[Miner] Background: Validator response failed (status={status_code}): {status_msg}")
-                else:
-                    bt.logging.info(
-                        f"[Miner] Background: Successfully sent processed TelegramBatch back to validator {validator_hotkey}"
+                    try:
+                        status_code = responses[0].dendrite.status_code if responses and responses[0].dendrite else None
+                        status_msg = responses[0].dendrite.status_message if responses and responses[0].dendrite else None
+                    except Exception:
+                        status_code, status_msg = None, None
+
+                    if status_code == 200:
+                        bt.logging.info(
+                            f"[Miner] Background: Successfully sent processed TelegramBatch back to validator {validator_hotkey}"
+                        )
+                        break
+
+                    retryable = status_code in (408, 429, 500, 502, 503, 504) or status_code is None
+                    if retryable and attempt < max_retries:
+                        bt.logging.warning(
+                            f"[Miner] Background: TelegramBatch push failed (status={status_code}): {status_msg}; "
+                            f"retrying {attempt + 1}/{max_retries} after backoff"
+                        )
+                        time.sleep(2.0 * (attempt + 1))
+                        continue
+
+                    bt.logging.error(
+                        f"[Miner] Background: Validator response failed (status={status_code}): {status_msg}"
                     )
+                    break
             except Exception as e:
                 bt.logging.error(f"[Miner] Background: Failed to send telegram response to validator: {e}")
             finally:

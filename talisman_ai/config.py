@@ -96,6 +96,11 @@ MINER_SEND_TIMEOUT = float(os.getenv("MINER_SEND_TIMEOUT", "6.0"))
 VALIDATOR_MINER_QUERY_CONCURRENCY = int(os.getenv("VALIDATOR_MINER_QUERY_CONCURRENCY", "8"))
 VALIDATOR_MAX_PENDING_MINER_TASKS = int(os.getenv("VALIDATOR_MAX_PENDING_MINER_TASKS", "256"))
 
+# Miner -> validator result push behavior.
+# Some validators can take longer to accept pushed results under load.
+MINER_PUSH_TIMEOUT = float(os.getenv("MINER_PUSH_TIMEOUT", "90.0"))
+MINER_PUSH_RETRIES = int(os.getenv("MINER_PUSH_RETRIES", "1"))
+
 # Tweet store configuration
 TWEET_STORE_LOCATION = os.getenv("TWEET_STORE_LOCATION", str(_SUBNET_ROOT / ".tweet_store.json"))
 TWEET_MAX_PROCESS_TIME = float(os.getenv("TWEET_MAX_PROCESS_TIME", "300.0"))  # 5 minutes default
