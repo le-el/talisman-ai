@@ -178,7 +178,7 @@ Copy `.vali_env_tmpl` to `.vali_env` and configure the following variables:
 ## 🪬 Running on Mainnet
 
 **Run Miner**
-
+pm2 start python3 --name 2talisman -- -m neurons.miner --netuid 45 --wallet.name miner --wallet.hotkey trishool --logging.info --axon.port 8092 --axon.external_port 8092
 
 
 ```bash
@@ -194,6 +194,22 @@ cp .miner_env_tmpl .miner_env
 ```
 
 *Optional: Add `--axon.external_port` and `--axon.external_ip`
+
+For multi-miner hosts using the shared Redis cache, tune these in `.miner_env`:
+
+- `MINER_WORKERS`: per-process analysis worker threads
+- `MINER_MAX_PENDING_TASKS`: hard cap on queued background jobs per process
+- `MINER_CACHE_BACKEND=redis`: enables shared dedupe across miner processes
+- `MINER_CACHE_LOCK_TTL_SECONDS`: Redis lock TTL for in-flight shared work
+- `MINER_CACHE_WAIT_TIMEOUT_SECONDS`: how long other miners wait for the lock-holder result
+- `MINER_CACHE_LOCK_HEARTBEAT_SECONDS`: interval for extending the Redis lock while analysis is still running
+
+Current miner behavior:
+
+- De-duplicates identical tweet / telegram analyses inside each miner process
+- De-duplicates identical analyses across multiple miner processes on the same Redis namespace
+- Uses one LLM classification call per item instead of multiple category-specific calls
+- Rejects new background work once the local pending queue reaches `MINER_MAX_PENDING_TASKS`
 
 **Run Validator**
 

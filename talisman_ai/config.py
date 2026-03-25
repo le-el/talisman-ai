@@ -100,6 +100,8 @@ VALIDATOR_MAX_PENDING_MINER_TASKS = int(os.getenv("VALIDATOR_MAX_PENDING_MINER_T
 # Some validators can take longer to accept pushed results under load.
 MINER_PUSH_TIMEOUT = float(os.getenv("MINER_PUSH_TIMEOUT", "90.0"))
 MINER_PUSH_RETRIES = int(os.getenv("MINER_PUSH_RETRIES", "1"))
+MINER_WORKERS = int(os.getenv("MINER_WORKERS", "8"))
+MINER_MAX_PENDING_TASKS = int(os.getenv("MINER_MAX_PENDING_TASKS", "128"))
 
 # Miner analysis cache (prevents duplicate LLM calls for repeated requests).
 MINER_CACHE_ENABLED = os.getenv("MINER_CACHE_ENABLED", "true")
@@ -116,9 +118,10 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 MINER_CACHE_REDIS_NAMESPACE = os.getenv("MINER_CACHE_REDIS_NAMESPACE", "talisman:sn45")
 
 # Distributed cache locking/singleflight
-MINER_CACHE_LOCK_TTL_SECONDS = float(os.getenv("MINER_CACHE_LOCK_TTL_SECONDS", "60"))
-MINER_CACHE_WAIT_TIMEOUT_SECONDS = float(os.getenv("MINER_CACHE_WAIT_TIMEOUT_SECONDS", "10"))
+MINER_CACHE_LOCK_TTL_SECONDS = float(os.getenv("MINER_CACHE_LOCK_TTL_SECONDS", "90"))
+MINER_CACHE_WAIT_TIMEOUT_SECONDS = float(os.getenv("MINER_CACHE_WAIT_TIMEOUT_SECONDS", "45"))
 MINER_CACHE_WAIT_POLL_INTERVAL_SECONDS = float(os.getenv("MINER_CACHE_WAIT_POLL_INTERVAL_SECONDS", "0.2"))
+MINER_CACHE_LOCK_HEARTBEAT_SECONDS = float(os.getenv("MINER_CACHE_LOCK_HEARTBEAT_SECONDS", "10"))
 
 # Tweet store configuration
 TWEET_STORE_LOCATION = os.getenv("TWEET_STORE_LOCATION", str(_SUBNET_ROOT / ".tweet_store.json"))

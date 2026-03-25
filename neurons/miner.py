@@ -50,6 +50,10 @@ class Miner(BaseMinerNeuron):
             max_workers=max(1, max_workers),
             thread_name_prefix="miner_worker_",
         )
+        self._max_pending_tasks = max(
+            max(1, max_workers),
+            int(getattr(talisman_ai.config, "MINER_MAX_PENDING_TASKS", max_workers * 16)),
+        )
         self._cache_enabled = str(getattr(talisman_ai.config, "MINER_CACHE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
         self._cache_ttl_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_TTL_SECONDS", 1800.0))
         self._cache_max_items = max(1, int(getattr(talisman_ai.config, "MINER_CACHE_MAX_ITEMS", 10000)))
@@ -61,6 +65,13 @@ class Miner(BaseMinerNeuron):
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_last_log_ts = time.time()
+        self._inflight_lock = threading.Lock()
+        self._tweet_inflight: dict = {}
+        self._telegram_inflight: dict = {}
+        self._cache_inflight_joins = 0
+        self._pending_lock = threading.Lock()
+        self._pending_tasks = 0
+        self._pending_rejections = 0
 
         # Redis distributed cache backend (shared across multiple miner processes on same server)
         self._redis_enabled = self._cache_backend == "redis" and redis_lib is not None
@@ -72,6 +83,13 @@ class Miner(BaseMinerNeuron):
         self._redis_lock_ttl_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_LOCK_TTL_SECONDS", 60.0))
         self._redis_wait_timeout_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_WAIT_TIMEOUT_SECONDS", 10.0))
         self._redis_wait_poll_interval_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_WAIT_POLL_INTERVAL_SECONDS", 0.2))
+        self._redis_lock_heartbeat_seconds = float(
+            getattr(
+                talisman_ai.config,
+                "MINER_CACHE_LOCK_HEARTBEAT_SECONDS",
+                max(1.0, self._redis_lock_ttl_seconds / 3.0),
+            )
+        )
         self._cache_hits_redis = 0
         self._cache_misses_redis = 0
         self._cache_wait_hits_redis = 0
@@ -227,6 +245,40 @@ class Miner(BaseMinerNeuron):
         except Exception:
             pass
 
+    def _redis_refresh_lock(self, lock_key: str, token: str) -> bool:
+        if not self._redis_enabled or self._redis is None:
+            return False
+        try:
+            ttl_ms = max(1000, int(self._redis_lock_ttl_seconds * 1000))
+            lua = """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('pexpire', KEYS[1], ARGV[2])
+            else
+                return 0
+            end
+            """
+            result = self._redis.eval(lua, 1, lock_key, token, ttl_ms)
+            return bool(result)
+        except Exception:
+            return False
+
+    def _start_lock_heartbeat(self, lock_key: str, token: str):
+        stop_event = threading.Event()
+
+        def _heartbeat():
+            interval = max(0.25, self._redis_lock_heartbeat_seconds)
+            while not stop_event.wait(interval):
+                if not self._redis_refresh_lock(lock_key, token):
+                    break
+
+        thread = threading.Thread(
+            target=_heartbeat,
+            daemon=True,
+            name="miner_redis_lock_heartbeat",
+        )
+        thread.start()
+        return stop_event, thread
+
     def _distributed_get_or_compute(
         self,
         local_cache_key: str,
@@ -257,7 +309,10 @@ class Miner(BaseMinerNeuron):
         token = uuid.uuid4().hex
         lock_acquired = self._redis_acquire_lock(lock_key, token)
         if lock_acquired:
+            heartbeat_stop = None
+            heartbeat_thread = None
             try:
+                heartbeat_stop, heartbeat_thread = self._start_lock_heartbeat(lock_key, token)
                 # Re-check after acquiring lock (another process may have filled it).
                 payload = self._redis_get_payload(data_key)
                 if payload is not None:
@@ -277,6 +332,10 @@ class Miner(BaseMinerNeuron):
                 )
                 return payload
             finally:
+                if heartbeat_stop is not None:
+                    heartbeat_stop.set()
+                if heartbeat_thread is not None:
+                    heartbeat_thread.join(timeout=1.0)
                 self._redis_release_lock(lock_key, token)
         else:
             # Wait briefly for the lock holder to populate Redis.
@@ -302,6 +361,95 @@ class Miner(BaseMinerNeuron):
             )
             return payload
 
+    def _get_or_compute_payload(
+        self,
+        *,
+        local_cache: dict,
+        inflight_map: dict,
+        cache_key: str,
+        compute_fn: typing.Callable[[], dict],
+        kind_label: str,
+        validator_hotkey: str,
+    ) -> dict:
+        cached = self._cache_get(local_cache, cache_key)
+        if cached is not None:
+            bt.logging.info(
+                f"[Miner][Cache] {kind_label} local cache hit key_prefix={cache_key[:28]}.. "
+                f"validator={validator_hotkey[:12]}.."
+            )
+            return cached
+
+        owner_future = None
+        is_owner = False
+        with self._inflight_lock:
+            owner_future = inflight_map.get(cache_key)
+            if owner_future is None:
+                owner_future = concurrent.futures.Future()
+                inflight_map[cache_key] = owner_future
+                is_owner = True
+            else:
+                with self._cache_lock:
+                    self._cache_inflight_joins += 1
+
+        if not is_owner:
+            bt.logging.info(
+                f"[Miner][Cache] {kind_label} inflight-join key_prefix={cache_key[:28]}.. "
+                f"validator={validator_hotkey[:12]}.."
+            )
+            payload = owner_future.result()
+            self._cache_set(local_cache, cache_key, payload)
+            return payload
+
+        try:
+            cached = self._cache_get(local_cache, cache_key)
+            if cached is not None:
+                owner_future.set_result(cached)
+                return cached
+
+            if self._redis_enabled:
+                payload = self._distributed_get_or_compute(
+                    local_cache_key=cache_key,
+                    compute_fn=compute_fn,
+                    kind_label=kind_label,
+                    validator_hotkey=validator_hotkey,
+                )
+            else:
+                payload = compute_fn()
+            self._cache_set(local_cache, cache_key, payload)
+            owner_future.set_result(payload)
+            return payload
+        except Exception as e:
+            owner_future.set_exception(e)
+            raise
+        finally:
+            with self._inflight_lock:
+                inflight_map.pop(cache_key, None)
+
+    def _submit_background_task(self, fn: typing.Callable, *args) -> bool:
+        with self._pending_lock:
+            if self._pending_tasks >= self._max_pending_tasks:
+                self._pending_rejections += 1
+                return False
+            self._pending_tasks += 1
+
+        try:
+            future = self._executor.submit(fn, *args)
+        except Exception:
+            with self._pending_lock:
+                self._pending_tasks = max(0, self._pending_tasks - 1)
+            raise
+
+        future.add_done_callback(self._on_background_task_done)
+        return True
+
+    def _on_background_task_done(self, future: concurrent.futures.Future) -> None:
+        with self._pending_lock:
+            self._pending_tasks = max(0, self._pending_tasks - 1)
+        try:
+            future.result()
+        except Exception as e:
+            bt.logging.error(f"[Miner] Background task failed: {e}")
+
     def _maybe_log_cache_stats(self) -> None:
         if not self._cache_enabled:
             return
@@ -319,13 +467,19 @@ class Miner(BaseMinerNeuron):
             redis_misses = int(self._cache_misses_redis)
             redis_wait_hits = int(self._cache_wait_hits_redis)
             redis_computed = int(self._cache_computed_redis)
+            inflight_joins = int(self._cache_inflight_joins)
+            with self._pending_lock:
+                pending_tasks = int(self._pending_tasks)
+                pending_rejections = int(self._pending_rejections)
             self._cache_last_log_ts = now
 
         bt.logging.info(
             f"[Miner][CacheStats] hits={hits} misses={misses} "
             f"hit_rate={hit_rate:.2f}% tweet_cache={tweet_size} "
             f"telegram_cache={telegram_size} ttl_s={self._cache_ttl_seconds:.0f} "
-            f"redis_hits={redis_hits} redis_misses={redis_misses} redis_wait_hits={redis_wait_hits} redis_computed={redis_computed}"
+            f"redis_hits={redis_hits} redis_misses={redis_misses} redis_wait_hits={redis_wait_hits} "
+            f"redis_computed={redis_computed} inflight_joins={inflight_joins} "
+            f"pending_tasks={pending_tasks}/{self._max_pending_tasks} pending_rejections={pending_rejections}"
         )
 
     async def blacklist_tweet_batch(
@@ -395,7 +549,14 @@ class Miner(BaseMinerNeuron):
         synapse_copy = copy.deepcopy(synapse)
         
         # Process asynchronously in a bounded worker pool.
-        self._executor.submit(self._process_and_send_tweets, synapse_copy, validator_hotkey)
+        submitted = self._submit_background_task(self._process_and_send_tweets, synapse_copy, validator_hotkey)
+        if not submitted:
+            bt.logging.warning(
+                f"[Miner] Background queue full ({self._max_pending_tasks}); "
+                f"dropping TweetBatch from validator {validator_hotkey[:12]}.."
+            )
+            self._maybe_log_cache_stats()
+            return synapse
         
         bt.logging.info(f"[Miner] Started background processing for TweetBatch, returning immediately")
         return synapse
@@ -424,7 +585,14 @@ class Miner(BaseMinerNeuron):
         synapse_copy = copy.deepcopy(synapse)
         
         # Process asynchronously in a bounded worker pool.
-        self._executor.submit(self._process_and_send_telegram_messages, synapse_copy, validator_hotkey)
+        submitted = self._submit_background_task(self._process_and_send_telegram_messages, synapse_copy, validator_hotkey)
+        if not submitted:
+            bt.logging.warning(
+                f"[Miner] Background queue full ({self._max_pending_tasks}); "
+                f"dropping TelegramBatch from validator {validator_hotkey[:12]}.."
+            )
+            self._maybe_log_cache_stats()
+            return synapse
         
         bt.logging.info(f"[Miner] Started background processing for TelegramBatch, returning immediately")
         return synapse
@@ -444,14 +612,6 @@ class Miner(BaseMinerNeuron):
             for tweet in synapse.tweet_batch:
                 text = tweet.text or ""
                 cache_key = self._make_tweet_cache_key(tweet)
-                cached = self._cache_get(self._tweet_analysis_cache, cache_key)
-                if cached is not None:
-                    bt.logging.info(
-                        f"[Miner][Cache] Tweet cache hit for tweet_id={tweet.id} from validator={validator_hotkey[:12]}.."
-                    )
-                    tweet.analysis = TweetAnalysisBase(**cached)
-                    self._maybe_log_cache_stats()
-                    continue
 
                 def compute_tweet_payload() -> dict:
                     # Classify the tweet (validator will re-run the same analyzer on the same text)
@@ -487,17 +647,14 @@ class Miner(BaseMinerNeuron):
                         "impact_potential": classification.impact_potential.value,
                     }
 
-                if self._redis_enabled:
-                    payload = self._distributed_get_or_compute(
-                        local_cache_key=cache_key,
-                        compute_fn=compute_tweet_payload,
-                        kind_label="Tweet",
-                        validator_hotkey=validator_hotkey,
-                    )
-                else:
-                    payload = compute_tweet_payload()
-
-                self._cache_set(self._tweet_analysis_cache, cache_key, payload)
+                payload = self._get_or_compute_payload(
+                    local_cache=self._tweet_analysis_cache,
+                    inflight_map=self._tweet_inflight,
+                    cache_key=cache_key,
+                    compute_fn=compute_tweet_payload,
+                    kind_label="Tweet",
+                    validator_hotkey=validator_hotkey,
+                )
                 tweet.analysis = TweetAnalysisBase(**payload)
                 self._maybe_log_cache_stats()
             
@@ -595,14 +752,6 @@ class Miner(BaseMinerNeuron):
             for msg in synapse.message_batch:
                 content = msg.content or ""
                 cache_key = self._make_telegram_cache_key(msg)
-                cached = self._cache_get(self._telegram_analysis_cache, cache_key)
-                if cached is not None:
-                    bt.logging.info(
-                        f"[Miner][Cache] Telegram cache hit for message_id={msg.id} from validator={validator_hotkey[:12]}.."
-                    )
-                    msg.analysis = TelegramMessageAnalysis(**cached)
-                    self._maybe_log_cache_stats()
-                    continue
                 
                 # Build message dict for analyzer
                 messages_for_analysis = [{
@@ -668,17 +817,14 @@ class Miner(BaseMinerNeuron):
                         "analyzed_at": datetime.now().isoformat(),
                     }
 
-                if self._redis_enabled:
-                    payload = self._distributed_get_or_compute(
-                        local_cache_key=cache_key,
-                        compute_fn=compute_telegram_payload,
-                        kind_label="Telegram",
-                        validator_hotkey=validator_hotkey,
-                    )
-                else:
-                    payload = compute_telegram_payload()
-
-                self._cache_set(self._telegram_analysis_cache, cache_key, payload)
+                payload = self._get_or_compute_payload(
+                    local_cache=self._telegram_analysis_cache,
+                    inflight_map=self._telegram_inflight,
+                    cache_key=cache_key,
+                    compute_fn=compute_telegram_payload,
+                    kind_label="Telegram",
+                    validator_hotkey=validator_hotkey,
+                )
                 msg.analysis = TelegramMessageAnalysis(**payload)
                 self._maybe_log_cache_stats()
             

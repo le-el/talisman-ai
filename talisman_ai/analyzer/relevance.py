@@ -187,6 +187,46 @@ IMPACT_TOOL = {
     }
 }
 
+CLASSIFICATION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "classify_post_dimensions",
+        "description": "Classify all non-subnet categorical dimensions for a post in one deterministic response",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content_type": {
+                    "type": "string",
+                    "enum": [ct.value for ct in ContentType],
+                },
+                "sentiment": {
+                    "type": "string",
+                    "enum": [s.value for s in Sentiment],
+                },
+                "technical_quality": {
+                    "type": "string",
+                    "enum": [tq.value for tq in TechnicalQuality],
+                },
+                "market_analysis": {
+                    "type": "string",
+                    "enum": [ma.value for ma in MarketAnalysis],
+                },
+                "impact_potential": {
+                    "type": "string",
+                    "enum": [ip.value for ip in ImpactPotential],
+                },
+            },
+            "required": [
+                "content_type",
+                "sentiment",
+                "technical_quality",
+                "market_analysis",
+                "impact_potential",
+            ],
+        },
+    },
+}
+
 
 class SubnetRelevanceAnalyzer:
     """
@@ -353,23 +393,17 @@ class SubnetRelevanceAnalyzer:
         try:
             # Step 1: Identify subnet (most critical decision)
             subnet_result = self._identify_subnet(text)
-            
-            # Step 2-6: Classify other dimensions atomically
-            content_type = self._classify_content_type(text)
-            sentiment = self._classify_sentiment(text)
-            technical_quality = self._assess_technical_quality(text)
-            market_analysis = self._classify_market_analysis(text)
-            impact = self._assess_impact(text)
+            dimensions = self._classify_dimensions(text)
             
             # Build final classification
             return PostClassification(
                 subnet_id=subnet_result['id'],
                 subnet_name=subnet_result['name'],
-                content_type=ContentType(content_type),
-                sentiment=Sentiment(sentiment),
-                technical_quality=TechnicalQuality(technical_quality),
-                market_analysis=MarketAnalysis(market_analysis),
-                impact_potential=ImpactPotential(impact),
+                content_type=ContentType(dimensions["content_type"]),
+                sentiment=Sentiment(dimensions["sentiment"]),
+                technical_quality=TechnicalQuality(dimensions["technical_quality"]),
+                market_analysis=MarketAnalysis(dimensions["market_analysis"]),
+                impact_potential=ImpactPotential(dimensions["impact_potential"]),
                 relevance_confidence=subnet_result['confidence'],
                 evidence_spans=subnet_result['evidence'],
                 anchors_detected=subnet_result['anchors']
@@ -398,6 +432,86 @@ class SubnetRelevanceAnalyzer:
             }
         
         return {'id': 0, 'name': "NONE_OF_THE_ABOVE", 'confidence': "low", 'evidence': [], 'anchors': []}
+
+    def _classify_dimensions(self, text: str) -> dict:
+        prompt = f"""Classify this BitTensor-related post into the exact categories below.
+
+Post:
+"{text}"
+
+Return exactly one label for each field.
+
+content_type:
+- announcement: product launches, releases, updates
+- partnership: collaborations, integrations, joint ventures
+- technical_insight: technical analysis, architecture, code discussions
+- milestone: achievements, metrics, progress updates
+- tutorial: how-to guides, educational content
+- security: audits, vulnerabilities, exploits, security updates
+- governance: voting, proposals, DAO decisions
+- market_discussion: price talk, trading, speculation
+- hiring: job postings, recruitment
+- meme: jokes, entertainment, humor
+- hype: excitement, enthusiasm, promotional content
+- opinion: personal views, analysis, commentary
+- community: general chatter, engagement, discussions
+- fud: fear, uncertainty, doubt, negative speculation
+- other: doesn't fit any category above
+
+sentiment:
+- very_bullish: moon, ATH, pump, explosive growth, massive gains
+- bullish: positive outlook, optimistic, growth potential, upward trend
+- neutral: factual reporting, balanced, no strong opinion, informational
+- bearish: concerns raised, negative outlook, downward trend, issues mentioned
+- very_bearish: crash, failure, exploit, major problem, severe concerns
+
+technical_quality:
+- high: 2+ specifics such as APIs, versions, repos, metrics or endpoints
+- medium: 1 specific technical detail
+- low: technical claims without specifics
+- none: no technical content
+
+market_analysis:
+- technical: indicators, price action, patterns, order flow
+- economic: fundamentals, costs, revenue, emissions
+- political: regulation, governance, policy decisions
+- social: narrative, virality, memes, community behavior
+- other: none or different
+
+impact_potential:
+- HIGH: major release, critical issue, major partnership
+- MEDIUM: notable update, launch, partnership
+- LOW: minor information
+- NONE: chatter, no meaningful impact
+"""
+
+        defaults = {
+            "content_type": "other",
+            "sentiment": "neutral",
+            "technical_quality": "none",
+            "market_analysis": "other",
+            "impact_potential": "NONE",
+        }
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[CLASSIFICATION_TOOL],
+                tool_choice={"type": "function", "function": {"name": "classify_post_dimensions"}},
+                temperature=0,
+                max_tokens=120
+            )
+            args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
+            return {
+                "content_type": args.get("content_type", defaults["content_type"]),
+                "sentiment": args.get("sentiment", defaults["sentiment"]),
+                "technical_quality": args.get("technical_quality", defaults["technical_quality"]),
+                "market_analysis": args.get("market_analysis", defaults["market_analysis"]),
+                "impact_potential": args.get("impact_potential", defaults["impact_potential"]),
+            }
+        except Exception:
+            return defaults
     
     def _classify_content_type(self, text: str) -> str:
         """Atomic decision: Content type"""
