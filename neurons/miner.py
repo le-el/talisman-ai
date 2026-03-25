@@ -5,7 +5,14 @@ import copy
 import asyncio
 import concurrent.futures
 import hashlib
+import json
+import uuid
 import bittensor as bt
+
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
 
 # Bittensor Miner Template:
 import talisman_ai
@@ -47,12 +54,44 @@ class Miner(BaseMinerNeuron):
         self._cache_ttl_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_TTL_SECONDS", 1800.0))
         self._cache_max_items = max(1, int(getattr(talisman_ai.config, "MINER_CACHE_MAX_ITEMS", 10000)))
         self._cache_log_interval_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_LOG_INTERVAL_SECONDS", 60.0))
+        self._cache_backend = str(getattr(talisman_ai.config, "MINER_CACHE_BACKEND", "local")).lower()
         self._tweet_analysis_cache: dict = {}
         self._telegram_analysis_cache: dict = {}
         self._cache_lock = threading.Lock()
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_last_log_ts = time.time()
+
+        # Redis distributed cache backend (shared across multiple miner processes on same server)
+        self._redis_enabled = self._cache_backend == "redis" and redis_lib is not None
+        self._redis = None
+        base_namespace = str(getattr(talisman_ai.config, "MINER_CACHE_REDIS_NAMESPACE", "talisman:sn45"))
+        analysis_sig_src = f"{getattr(talisman_ai.config, 'MODEL', '')}|{getattr(talisman_ai.config, 'LLM_BASE', '')}"
+        analysis_sig = hashlib.sha256(analysis_sig_src.encode("utf-8")).hexdigest()[:12]
+        self._redis_namespace = f"{base_namespace}:{analysis_sig}"
+        self._redis_lock_ttl_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_LOCK_TTL_SECONDS", 60.0))
+        self._redis_wait_timeout_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_WAIT_TIMEOUT_SECONDS", 10.0))
+        self._redis_wait_poll_interval_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_WAIT_POLL_INTERVAL_SECONDS", 0.2))
+        self._cache_hits_redis = 0
+        self._cache_misses_redis = 0
+        self._cache_wait_hits_redis = 0
+        self._cache_computed_redis = 0
+
+        if self._redis_enabled:
+            try:
+                redis_url = str(getattr(talisman_ai.config, "REDIS_URL", "redis://127.0.0.1:6379/0"))
+                redis_password = getattr(talisman_ai.config, "REDIS_PASSWORD", None)
+                if redis_password:
+                    self._redis = redis_lib.Redis.from_url(redis_url, password=redis_password, decode_responses=False)
+                else:
+                    self._redis = redis_lib.Redis.from_url(redis_url, decode_responses=False)
+                # Basic connectivity check
+                self._redis.ping()
+                bt.logging.info(f"[Miner][Cache] Redis backend enabled: namespace={self._redis_namespace}")
+            except Exception as e:
+                bt.logging.warning(f"[Miner][Cache] Redis backend disabled (init failed): {e}")
+                self._redis_enabled = False
+                self._redis = None
 
         # IMPORTANT: Register a concrete TweetBatch handler on the axon.
         # Bittensor routes requests by synapse class name; attaching only `forward(self, bt.Synapse)`
@@ -129,6 +168,140 @@ class Miner(BaseMinerNeuron):
                     except Exception:
                         break
 
+    def _redis_data_key(self, local_cache_key: str) -> str:
+        # local_cache_key already encodes tweet/message identity + content hash.
+        return f"{self._redis_namespace}:{local_cache_key}"
+
+    def _redis_lock_key(self, data_key: str) -> str:
+        digest = hashlib.sha256(data_key.encode("utf-8")).hexdigest()
+        return f"{self._redis_namespace}:lock:{digest}"
+
+    def _redis_get_payload(self, data_key: str):
+        if not self._redis_enabled or self._redis is None:
+            return None
+        try:
+            raw = self._redis.get(data_key)
+            if raw is None:
+                return None
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8")
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def _redis_set_payload(self, data_key: str, payload: dict) -> None:
+        if not self._redis_enabled or self._redis is None:
+            return
+        try:
+            dumped = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            # Use at least 1 second for EX.
+            ex = max(1, int(self._cache_ttl_seconds))
+            self._redis.set(data_key, dumped, ex=ex)
+        except Exception:
+            pass
+
+    def _redis_acquire_lock(self, lock_key: str, token: str) -> bool:
+        if not self._redis_enabled or self._redis is None:
+            return False
+        try:
+            # SET key value NX EX ttl
+            ex = max(1, int(self._redis_lock_ttl_seconds))
+            ok = self._redis.set(lock_key, token, nx=True, ex=ex)
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _redis_release_lock(self, lock_key: str, token: str) -> None:
+        if not self._redis_enabled or self._redis is None:
+            return
+        try:
+            # Release lock only if still owned (token matches)
+            lua = """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            else
+                return 0
+            end
+            """
+            self._redis.eval(lua, 1, lock_key, token)
+        except Exception:
+            pass
+
+    def _distributed_get_or_compute(
+        self,
+        local_cache_key: str,
+        compute_fn: typing.Callable[[], dict],
+        kind_label: str,
+        validator_hotkey: str,
+    ) -> dict:
+        """
+        Distributed (Redis) singleflight-style cache:
+        L1: local dict (already checked outside)
+        L2: Redis GET
+        L3: Redis lock + wait/poll to prevent stampede
+        """
+        data_key = self._redis_data_key(local_cache_key)
+        payload = self._redis_get_payload(data_key)
+        if payload is not None:
+            with self._cache_lock:
+                self._cache_hits_redis += 1
+            bt.logging.info(
+                f"[Miner][Cache][Redis] {kind_label} redis hit local_key_prefix={local_cache_key[:28]}.. validator={validator_hotkey[:12]}.."
+            )
+            return payload
+
+        with self._cache_lock:
+            self._cache_misses_redis += 1
+
+        lock_key = self._redis_lock_key(data_key)
+        token = uuid.uuid4().hex
+        lock_acquired = self._redis_acquire_lock(lock_key, token)
+        if lock_acquired:
+            try:
+                # Re-check after acquiring lock (another process may have filled it).
+                payload = self._redis_get_payload(data_key)
+                if payload is not None:
+                    with self._cache_lock:
+                        self._cache_hits_redis += 1
+                    bt.logging.info(
+                        f"[Miner][Cache][Redis] {kind_label} redis hit-after-lock validator={validator_hotkey[:12]}.."
+                    )
+                    return payload
+
+                payload = compute_fn()
+                self._redis_set_payload(data_key, payload)
+                with self._cache_lock:
+                    self._cache_computed_redis += 1
+                bt.logging.info(
+                    f"[Miner][Cache][Redis] {kind_label} computed by lock-holder validator={validator_hotkey[:12]}.."
+                )
+                return payload
+            finally:
+                self._redis_release_lock(lock_key, token)
+        else:
+            # Wait briefly for the lock holder to populate Redis.
+            deadline = time.time() + self._redis_wait_timeout_seconds
+            while time.time() < deadline:
+                payload = self._redis_get_payload(data_key)
+                if payload is not None:
+                    with self._cache_lock:
+                        self._cache_wait_hits_redis += 1
+                    bt.logging.info(
+                        f"[Miner][Cache][Redis] {kind_label} wait-hit validator={validator_hotkey[:12]}.."
+                    )
+                    return payload
+                time.sleep(self._redis_wait_poll_interval_seconds)
+
+            # Last resort: compute anyway to avoid long stalls.
+            payload = compute_fn()
+            self._redis_set_payload(data_key, payload)
+            with self._cache_lock:
+                self._cache_computed_redis += 1
+            bt.logging.info(
+                f"[Miner][Cache][Redis] {kind_label} computed after-wait-timeout validator={validator_hotkey[:12]}.."
+            )
+            return payload
+
     def _maybe_log_cache_stats(self) -> None:
         if not self._cache_enabled:
             return
@@ -142,12 +315,17 @@ class Miner(BaseMinerNeuron):
             hit_rate = (hits / total * 100.0) if total > 0 else 0.0
             tweet_size = len(self._tweet_analysis_cache)
             telegram_size = len(self._telegram_analysis_cache)
+            redis_hits = int(self._cache_hits_redis)
+            redis_misses = int(self._cache_misses_redis)
+            redis_wait_hits = int(self._cache_wait_hits_redis)
+            redis_computed = int(self._cache_computed_redis)
             self._cache_last_log_ts = now
 
         bt.logging.info(
             f"[Miner][CacheStats] hits={hits} misses={misses} "
             f"hit_rate={hit_rate:.2f}% tweet_cache={tweet_size} "
-            f"telegram_cache={telegram_size} ttl_s={self._cache_ttl_seconds:.0f}"
+            f"telegram_cache={telegram_size} ttl_s={self._cache_ttl_seconds:.0f} "
+            f"redis_hits={redis_hits} redis_misses={redis_misses} redis_wait_hits={redis_wait_hits} redis_computed={redis_computed}"
         )
 
     async def blacklist_tweet_batch(
@@ -275,58 +453,52 @@ class Miner(BaseMinerNeuron):
                     self._maybe_log_cache_stats()
                     continue
 
-                # Classify the tweet (validator will re-run the same analyzer on the same text)
-                classification = None
-                try:
-                    classification = self.analyzer.classify_post(text)
-                except Exception:
+                def compute_tweet_payload() -> dict:
+                    # Classify the tweet (validator will re-run the same analyzer on the same text)
                     classification = None
-                
-                # If classification fails, fall back to analyzer defaults to avoid returning missing analysis.
-                if classification is None:
-                    bt.logging.warning(f"[Miner] Failed to classify tweet {tweet.id}; returning fallback analysis")
-                    payload = {
-                        "sentiment": "neutral",
-                        "subnet_id": 0,
-                        "subnet_name": "NONE_OF_THE_ABOVE",
-                        "content_type": "other",
-                        "technical_quality": "none",
-                        "market_analysis": "other",
-                        "impact_potential": "NONE",
-                    }
-                    self._cache_set(self._tweet_analysis_cache, cache_key, payload)
-                    tweet.analysis = TweetAnalysisBase(
-                        sentiment="neutral",
-                        subnet_id=0,
-                        subnet_name="NONE_OF_THE_ABOVE",
-                        content_type="other",
-                        technical_quality="none",
-                        market_analysis="other",
-                        impact_potential="NONE",
-                    )
-                    self._maybe_log_cache_stats()
-                    continue
+                    try:
+                        classification = self.analyzer.classify_post(text)
+                    except Exception:
+                        classification = None
 
-                # Create analysis object with required fields for validator
-                payload = {
-                    "sentiment": classification.sentiment.value,
-                    "subnet_id": classification.subnet_id,
-                    "subnet_name": classification.subnet_name,
-                    "content_type": classification.content_type.value,
-                    "technical_quality": classification.technical_quality.value,
-                    "market_analysis": classification.market_analysis.value,
-                    "impact_potential": classification.impact_potential.value,
-                }
+                    # If classification fails, fall back to defaults to avoid returning missing analysis.
+                    if classification is None:
+                        bt.logging.warning(
+                            f"[Miner] Failed to classify tweet {tweet.id}; returning fallback analysis"
+                        )
+                        return {
+                            "sentiment": "neutral",
+                            "subnet_id": 0,
+                            "subnet_name": "NONE_OF_THE_ABOVE",
+                            "content_type": "other",
+                            "technical_quality": "none",
+                            "market_analysis": "other",
+                            "impact_potential": "NONE",
+                        }
+
+                    # Create payload with required fields for validator.
+                    return {
+                        "sentiment": classification.sentiment.value,
+                        "subnet_id": classification.subnet_id,
+                        "subnet_name": classification.subnet_name,
+                        "content_type": classification.content_type.value,
+                        "technical_quality": classification.technical_quality.value,
+                        "market_analysis": classification.market_analysis.value,
+                        "impact_potential": classification.impact_potential.value,
+                    }
+
+                if self._redis_enabled:
+                    payload = self._distributed_get_or_compute(
+                        local_cache_key=cache_key,
+                        compute_fn=compute_tweet_payload,
+                        kind_label="Tweet",
+                        validator_hotkey=validator_hotkey,
+                    )
+                else:
+                    payload = compute_tweet_payload()
+
                 self._cache_set(self._tweet_analysis_cache, cache_key, payload)
-                tweet.analysis = TweetAnalysisBase(
-                    sentiment=classification.sentiment.value,
-                    subnet_id=classification.subnet_id,
-                    subnet_name=classification.subnet_name,
-                    content_type=classification.content_type.value,
-                    technical_quality=classification.technical_quality.value,
-                    market_analysis=classification.market_analysis.value,
-                    impact_potential=classification.impact_potential.value,
-                )
+                tweet.analysis = TweetAnalysisBase(**payload)
                 self._maybe_log_cache_stats()
             
             bt.logging.info(f"[Miner] Background: Finished processing, sending back to validator {validator_hotkey}")
@@ -450,80 +622,64 @@ class Miner(BaseMinerNeuron):
                 
                 # Use inherited subnet_id if provided (don't reclassify)
                 inherited_subnet_id = msg.inherited_subnet_id
-                
-                # Classify the message group
-                classification = None
-                try:
-                    classification = self.telegram_analyzer.classify_message_group(
-                        messages_for_analysis,
-                        subnet_id=inherited_subnet_id,
-                    )
-                except Exception:
-                    classification = None
 
-                # If classification fails, fall back to safe defaults to avoid missing analysis.
-                if classification is None:
-                    bt.logging.warning(f"[Miner] Failed to classify telegram message {msg.id}; returning fallback analysis")
-                    from datetime import datetime
-                    payload = {
+                from datetime import datetime
+
+                def compute_telegram_payload() -> dict:
+                    # Classify the message group
+                    classification = None
+                    try:
+                        classification = self.telegram_analyzer.classify_message_group(
+                            messages_for_analysis,
+                            subnet_id=inherited_subnet_id,
+                        )
+                    except Exception:
+                        classification = None
+
+                    if classification is None:
+                        bt.logging.warning(
+                            f"[Miner] Failed to classify telegram message {msg.id}; returning fallback analysis"
+                        )
+                        return {
+                            "id": 0,
+                            "message_id": msg.id,
+                            "sentiment": "neutral",
+                            "subnet_id": int(inherited_subnet_id) if inherited_subnet_id is not None else 0,
+                            "subnet_name": "NONE_OF_THE_ABOVE",
+                            "content_type": "other",
+                            "technical_quality": "none",
+                            "market_analysis": "other",
+                            "impact_potential": "NONE",
+                            "relevance_confidence": None,
+                            "analyzed_at": datetime.now().isoformat(),
+                        }
+
+                    return {
                         "id": 0,
                         "message_id": msg.id,
-                        "sentiment": "neutral",
-                        "subnet_id": int(inherited_subnet_id) if inherited_subnet_id is not None else 0,
-                        "subnet_name": "NONE_OF_THE_ABOVE",
-                        "content_type": "other",
-                        "technical_quality": "none",
-                        "market_analysis": "other",
-                        "impact_potential": "NONE",
-                        "relevance_confidence": None,
+                        "sentiment": classification.sentiment.value,
+                        "subnet_id": classification.subnet_id,
+                        "subnet_name": classification.subnet_name,
+                        "content_type": classification.content_type.value,
+                        "technical_quality": classification.technical_quality.value,
+                        "market_analysis": classification.market_analysis.value,
+                        "impact_potential": classification.impact_potential.value,
+                        "relevance_confidence": classification.relevance_confidence,
                         "analyzed_at": datetime.now().isoformat(),
                     }
-                    self._cache_set(self._telegram_analysis_cache, cache_key, payload)
-                    msg.analysis = TelegramMessageAnalysis(
-                        id=0,  # Placeholder, will be assigned by API
-                        message_id=msg.id,
-                        sentiment="neutral",
-                        subnet_id=int(inherited_subnet_id) if inherited_subnet_id is not None else 0,
-                        subnet_name="NONE_OF_THE_ABOVE",
-                        content_type="other",
-                        technical_quality="none",
-                        market_analysis="other",
-                        impact_potential="NONE",
-                        relevance_confidence=None,
-                        analyzed_at=datetime.now().isoformat(),
+
+                if self._redis_enabled:
+                    payload = self._distributed_get_or_compute(
+                        local_cache_key=cache_key,
+                        compute_fn=compute_telegram_payload,
+                        kind_label="Telegram",
+                        validator_hotkey=validator_hotkey,
                     )
-                    self._maybe_log_cache_stats()
-                    continue
-                
-                # Create analysis object with required fields for validator
-                from datetime import datetime
-                payload = {
-                    "id": 0,
-                    "message_id": msg.id,
-                    "sentiment": classification.sentiment.value,
-                    "subnet_id": classification.subnet_id,
-                    "subnet_name": classification.subnet_name,
-                    "content_type": classification.content_type.value,
-                    "technical_quality": classification.technical_quality.value,
-                    "market_analysis": classification.market_analysis.value,
-                    "impact_potential": classification.impact_potential.value,
-                    "relevance_confidence": classification.relevance_confidence,
-                    "analyzed_at": datetime.now().isoformat(),
-                }
+                else:
+                    payload = compute_telegram_payload()
+
                 self._cache_set(self._telegram_analysis_cache, cache_key, payload)
-                msg.analysis = TelegramMessageAnalysis(
-                    id=0,  # Placeholder, will be assigned by API
-                    message_id=msg.id,
-                    sentiment=classification.sentiment.value,
-                    subnet_id=classification.subnet_id,
-                    subnet_name=classification.subnet_name,
-                    content_type=classification.content_type.value,
-                    technical_quality=classification.technical_quality.value,
-                    market_analysis=classification.market_analysis.value,
-                    impact_potential=classification.impact_potential.value,
-                    relevance_confidence=classification.relevance_confidence,
-                    analyzed_at=datetime.now().isoformat(),
-                )
+                msg.analysis = TelegramMessageAnalysis(**payload)
                 self._maybe_log_cache_stats()
             
             bt.logging.info(f"[Miner] Background: Finished processing telegram messages, sending back to validator {validator_hotkey}")

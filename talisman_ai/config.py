@@ -107,6 +107,19 @@ MINER_CACHE_TTL_SECONDS = float(os.getenv("MINER_CACHE_TTL_SECONDS", "1800"))
 MINER_CACHE_MAX_ITEMS = int(os.getenv("MINER_CACHE_MAX_ITEMS", "10000"))
 MINER_CACHE_LOG_INTERVAL_SECONDS = float(os.getenv("MINER_CACHE_LOG_INTERVAL_SECONDS", "60"))
 
+# Cache backend (local memory only vs shared Redis)
+MINER_CACHE_BACKEND = os.getenv("MINER_CACHE_BACKEND", "local").lower()  # "local" | "redis"
+
+# Redis settings for shared cache
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+MINER_CACHE_REDIS_NAMESPACE = os.getenv("MINER_CACHE_REDIS_NAMESPACE", "talisman:sn45")
+
+# Distributed cache locking/singleflight
+MINER_CACHE_LOCK_TTL_SECONDS = float(os.getenv("MINER_CACHE_LOCK_TTL_SECONDS", "60"))
+MINER_CACHE_WAIT_TIMEOUT_SECONDS = float(os.getenv("MINER_CACHE_WAIT_TIMEOUT_SECONDS", "10"))
+MINER_CACHE_WAIT_POLL_INTERVAL_SECONDS = float(os.getenv("MINER_CACHE_WAIT_POLL_INTERVAL_SECONDS", "0.2"))
+
 # Tweet store configuration
 TWEET_STORE_LOCATION = os.getenv("TWEET_STORE_LOCATION", str(_SUBNET_ROOT / ".tweet_store.json"))
 TWEET_MAX_PROCESS_TIME = float(os.getenv("TWEET_MAX_PROCESS_TIME", "300.0"))  # 5 minutes default
