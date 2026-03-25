@@ -19,3 +19,11 @@ BLOCKS_PER_WINDOW=100
 # Maximum posts to scrape and submit per block window (default: 5, matches API v2 rate limit)
 # Must match MAX_SUBMISSION_RATE in api_v2 if using API v2
 MAX_SUBMISSIONS_PER_WINDOW=5
+
+# Miner push + cache tuning
+MINER_PUSH_TIMEOUT=90
+MINER_PUSH_RETRIES=1
+MINER_CACHE_ENABLED=true
+MINER_CACHE_TTL_SECONDS=1800
+MINER_CACHE_MAX_ITEMS=10000
+MINER_CACHE_LOG_INTERVAL_SECONDS=60

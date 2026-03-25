@@ -4,6 +4,7 @@ import threading
 import copy
 import asyncio
 import concurrent.futures
+import hashlib
 import bittensor as bt
 
 # Bittensor Miner Template:
@@ -42,6 +43,16 @@ class Miner(BaseMinerNeuron):
             max_workers=max(1, max_workers),
             thread_name_prefix="miner_worker_",
         )
+        self._cache_enabled = str(getattr(talisman_ai.config, "MINER_CACHE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
+        self._cache_ttl_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_TTL_SECONDS", 1800.0))
+        self._cache_max_items = max(1, int(getattr(talisman_ai.config, "MINER_CACHE_MAX_ITEMS", 10000)))
+        self._cache_log_interval_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_LOG_INTERVAL_SECONDS", 60.0))
+        self._tweet_analysis_cache: dict = {}
+        self._telegram_analysis_cache: dict = {}
+        self._cache_lock = threading.Lock()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_last_log_ts = time.time()
 
         # IMPORTANT: Register a concrete TweetBatch handler on the axon.
         # Bittensor routes requests by synapse class name; attaching only `forward(self, bt.Synapse)`
@@ -61,6 +72,82 @@ class Miner(BaseMinerNeuron):
         
         hotkey = self.wallet.hotkey.ss58_address
         bt.logging.info(f"[Miner] V3 miner started with hotkey: {hotkey}")
+
+    def _make_tweet_cache_key(self, tweet) -> str:
+        tweet_id = str(getattr(tweet, "id", "") or "")
+        text = str(getattr(tweet, "text", "") or "")
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return f"tweet:{tweet_id}:{digest}"
+
+    def _make_telegram_cache_key(self, msg) -> str:
+        message_id = str(getattr(msg, "id", "") or "")
+        content = str(getattr(msg, "content", "") or "")
+        inherited_subnet_id = str(getattr(msg, "inherited_subnet_id", "") or "")
+        context_messages = getattr(msg, "context_messages", None) or []
+        ctx_parts = []
+        for ctx in context_messages:
+            ctx_id = str(getattr(ctx, "id", "") or "")
+            ctx_content = str(getattr(ctx, "content", "") or "")
+            ctx_parts.append(f"{ctx_id}:{ctx_content}")
+        ctx_blob = "|".join(ctx_parts)
+        digest = hashlib.sha256(f"{content}|{ctx_blob}|{inherited_subnet_id}".encode("utf-8")).hexdigest()
+        return f"telegram:{message_id}:{digest}"
+
+    def _cache_get(self, cache: dict, key: str):
+        if not self._cache_enabled:
+            return None
+        now = time.time()
+        with self._cache_lock:
+            entry = cache.get(key)
+            if not entry:
+                self._cache_misses += 1
+                return None
+            expires_at, payload = entry
+            if expires_at < now:
+                try:
+                    del cache[key]
+                except Exception:
+                    pass
+                self._cache_misses += 1
+                return None
+            self._cache_hits += 1
+            return payload
+
+    def _cache_set(self, cache: dict, key: str, payload: dict) -> None:
+        if not self._cache_enabled:
+            return
+        now = time.time()
+        expires_at = now + self._cache_ttl_seconds
+        with self._cache_lock:
+            cache[key] = (expires_at, payload)
+            if len(cache) > self._cache_max_items:
+                # Remove oldest entries first (insertion-ordered dict on modern Python).
+                overflow = len(cache) - self._cache_max_items
+                for _ in range(max(0, overflow)):
+                    try:
+                        cache.pop(next(iter(cache)))
+                    except Exception:
+                        break
+
+    def _maybe_log_cache_stats(self) -> None:
+        if not self._cache_enabled:
+            return
+        now = time.time()
+        with self._cache_lock:
+            if (now - self._cache_last_log_ts) < self._cache_log_interval_seconds:
+                return
+            hits = int(self._cache_hits)
+            misses = int(self._cache_misses)
+            total = hits + misses
+            hit_rate = (hits / total * 100.0) if total > 0 else 0.0
+            tweet_size = len(self._tweet_analysis_cache)
+            telegram_size = len(self._telegram_analysis_cache)
+            self._cache_last_log_ts = now
+
+        bt.logging.info(
+            "[Miner][CacheStats] hits=%d misses=%d hit_rate=%.2f%% tweet_cache=%d telegram_cache=%d ttl_s=%.0f",
+            hits, misses, hit_rate, tweet_size, telegram_size, self._cache_ttl_seconds
+        )
 
     async def blacklist_tweet_batch(
         self, synapse: talisman_ai.protocol.TweetBatch
@@ -177,6 +264,15 @@ class Miner(BaseMinerNeuron):
             # Process each tweet (always attach analysis; missing analysis is frequently sampled and rejected)
             for tweet in synapse.tweet_batch:
                 text = tweet.text or ""
+                cache_key = self._make_tweet_cache_key(tweet)
+                cached = self._cache_get(self._tweet_analysis_cache, cache_key)
+                if cached is not None:
+                    bt.logging.info(
+                        f"[Miner][Cache] Tweet cache hit for tweet_id={tweet.id} from validator={validator_hotkey[:12]}.."
+                    )
+                    tweet.analysis = TweetAnalysisBase(**cached)
+                    self._maybe_log_cache_stats()
+                    continue
 
                 # Classify the tweet (validator will re-run the same analyzer on the same text)
                 classification = None
@@ -188,6 +284,16 @@ class Miner(BaseMinerNeuron):
                 # If classification fails, fall back to analyzer defaults to avoid returning missing analysis.
                 if classification is None:
                     bt.logging.warning(f"[Miner] Failed to classify tweet {tweet.id}; returning fallback analysis")
+                    payload = {
+                        "sentiment": "neutral",
+                        "subnet_id": 0,
+                        "subnet_name": "NONE_OF_THE_ABOVE",
+                        "content_type": "other",
+                        "technical_quality": "none",
+                        "market_analysis": "other",
+                        "impact_potential": "NONE",
+                    }
+                    self._cache_set(self._tweet_analysis_cache, cache_key, payload)
                     tweet.analysis = TweetAnalysisBase(
                         sentiment="neutral",
                         subnet_id=0,
@@ -197,9 +303,20 @@ class Miner(BaseMinerNeuron):
                         market_analysis="other",
                         impact_potential="NONE",
                     )
+                    self._maybe_log_cache_stats()
                     continue
 
                 # Create analysis object with required fields for validator
+                payload = {
+                    "sentiment": classification.sentiment.value,
+                    "subnet_id": classification.subnet_id,
+                    "subnet_name": classification.subnet_name,
+                    "content_type": classification.content_type.value,
+                    "technical_quality": classification.technical_quality.value,
+                    "market_analysis": classification.market_analysis.value,
+                    "impact_potential": classification.impact_potential.value,
+                }
+                self._cache_set(self._tweet_analysis_cache, cache_key, payload)
                 tweet.analysis = TweetAnalysisBase(
                     sentiment=classification.sentiment.value,
                     subnet_id=classification.subnet_id,
@@ -209,6 +326,7 @@ class Miner(BaseMinerNeuron):
                     market_analysis=classification.market_analysis.value,
                     impact_potential=classification.impact_potential.value,
                 )
+                self._maybe_log_cache_stats()
             
             bt.logging.info(f"[Miner] Background: Finished processing, sending back to validator {validator_hotkey}")
             
@@ -303,6 +421,15 @@ class Miner(BaseMinerNeuron):
             # Process each message (always attach analysis; missing analysis is frequently sampled and rejected)
             for msg in synapse.message_batch:
                 content = msg.content or ""
+                cache_key = self._make_telegram_cache_key(msg)
+                cached = self._cache_get(self._telegram_analysis_cache, cache_key)
+                if cached is not None:
+                    bt.logging.info(
+                        f"[Miner][Cache] Telegram cache hit for message_id={msg.id} from validator={validator_hotkey[:12]}.."
+                    )
+                    msg.analysis = TelegramMessageAnalysis(**cached)
+                    self._maybe_log_cache_stats()
+                    continue
                 
                 # Build message dict for analyzer
                 messages_for_analysis = [{
@@ -337,6 +464,20 @@ class Miner(BaseMinerNeuron):
                 if classification is None:
                     bt.logging.warning(f"[Miner] Failed to classify telegram message {msg.id}; returning fallback analysis")
                     from datetime import datetime
+                    payload = {
+                        "id": 0,
+                        "message_id": msg.id,
+                        "sentiment": "neutral",
+                        "subnet_id": int(inherited_subnet_id) if inherited_subnet_id is not None else 0,
+                        "subnet_name": "NONE_OF_THE_ABOVE",
+                        "content_type": "other",
+                        "technical_quality": "none",
+                        "market_analysis": "other",
+                        "impact_potential": "NONE",
+                        "relevance_confidence": None,
+                        "analyzed_at": datetime.now().isoformat(),
+                    }
+                    self._cache_set(self._telegram_analysis_cache, cache_key, payload)
                     msg.analysis = TelegramMessageAnalysis(
                         id=0,  # Placeholder, will be assigned by API
                         message_id=msg.id,
@@ -350,10 +491,25 @@ class Miner(BaseMinerNeuron):
                         relevance_confidence=None,
                         analyzed_at=datetime.now().isoformat(),
                     )
+                    self._maybe_log_cache_stats()
                     continue
                 
                 # Create analysis object with required fields for validator
                 from datetime import datetime
+                payload = {
+                    "id": 0,
+                    "message_id": msg.id,
+                    "sentiment": classification.sentiment.value,
+                    "subnet_id": classification.subnet_id,
+                    "subnet_name": classification.subnet_name,
+                    "content_type": classification.content_type.value,
+                    "technical_quality": classification.technical_quality.value,
+                    "market_analysis": classification.market_analysis.value,
+                    "impact_potential": classification.impact_potential.value,
+                    "relevance_confidence": classification.relevance_confidence,
+                    "analyzed_at": datetime.now().isoformat(),
+                }
+                self._cache_set(self._telegram_analysis_cache, cache_key, payload)
                 msg.analysis = TelegramMessageAnalysis(
                     id=0,  # Placeholder, will be assigned by API
                     message_id=msg.id,
@@ -367,6 +523,7 @@ class Miner(BaseMinerNeuron):
                     relevance_confidence=classification.relevance_confidence,
                     analyzed_at=datetime.now().isoformat(),
                 )
+                self._maybe_log_cache_stats()
             
             bt.logging.info(f"[Miner] Background: Finished processing telegram messages, sending back to validator {validator_hotkey}")
             
