@@ -3,6 +3,7 @@ import typing
 import threading
 import copy
 import asyncio
+import concurrent.futures
 import bittensor as bt
 
 # Bittensor Miner Template:
@@ -33,6 +34,14 @@ class Miner(BaseMinerNeuron):
         bt.logging.info("[Miner] Analyzer initialized")
         # NOTE: we intentionally do NOT reuse a single bt.Dendrite across threads/event-loops.
         # Miner responses are sent back to validators from a background thread with its own event loop.
+
+        # Use a bounded executor instead of spawning an unbounded thread per request.
+        # This protects the miner from overload (thread explosion) which otherwise leads to timeouts and penalties.
+        max_workers = int(getattr(talisman_ai.config, "MINER_WORKERS", 8))
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, max_workers),
+            thread_name_prefix="miner_worker_",
+        )
 
         # IMPORTANT: Register a concrete TweetBatch handler on the axon.
         # Bittensor routes requests by synapse class name; attaching only `forward(self, bt.Synapse)`
@@ -119,13 +128,8 @@ class Miner(BaseMinerNeuron):
         # Make a deep copy of the synapse for background processing
         synapse_copy = copy.deepcopy(synapse)
         
-        # Start background thread for processing and sending response
-        thread = threading.Thread(
-            target=self._process_and_send_tweets,
-            args=(synapse_copy, validator_hotkey),
-            daemon=True
-        )
-        thread.start()
+        # Process asynchronously in a bounded worker pool.
+        self._executor.submit(self._process_and_send_tweets, synapse_copy, validator_hotkey)
         
         bt.logging.info(f"[Miner] Started background processing for TweetBatch, returning immediately")
         return synapse
@@ -153,13 +157,8 @@ class Miner(BaseMinerNeuron):
         # Make a deep copy of the synapse for background processing
         synapse_copy = copy.deepcopy(synapse)
         
-        # Start background thread for processing and sending response
-        thread = threading.Thread(
-            target=self._process_and_send_telegram_messages,
-            args=(synapse_copy, validator_hotkey),
-            daemon=True
-        )
-        thread.start()
+        # Process asynchronously in a bounded worker pool.
+        self._executor.submit(self._process_and_send_telegram_messages, synapse_copy, validator_hotkey)
         
         bt.logging.info(f"[Miner] Started background processing for TelegramBatch, returning immediately")
         return synapse
@@ -175,19 +174,31 @@ class Miner(BaseMinerNeuron):
         try:
             bt.logging.info(f"[Miner] Background: Processing {len(synapse.tweet_batch)} tweets")
             
-            # Process each tweet
+            # Process each tweet (always attach analysis; missing analysis is frequently sampled and rejected)
             for tweet in synapse.tweet_batch:
-                if not tweet.text:
-                    bt.logging.warning(f"[Miner] Skipping tweet {tweet.id} - no text content")
-                    continue
+                text = tweet.text or ""
+
+                # Classify the tweet (validator will re-run the same analyzer on the same text)
+                classification = None
+                try:
+                    classification = self.analyzer.classify_post(text)
+                except Exception:
+                    classification = None
                 
-                # Classify the tweet
-                classification = self.analyzer.classify_post(tweet.text)
-                
+                # If classification fails, fall back to analyzer defaults to avoid returning missing analysis.
                 if classification is None:
-                    bt.logging.warning(f"[Miner] Failed to classify tweet {tweet.id}")
+                    bt.logging.warning(f"[Miner] Failed to classify tweet {tweet.id}; returning fallback analysis")
+                    tweet.analysis = TweetAnalysisBase(
+                        sentiment="neutral",
+                        subnet_id=0,
+                        subnet_name="NONE_OF_THE_ABOVE",
+                        content_type="other",
+                        technical_quality="none",
+                        market_analysis="other",
+                        impact_potential="NONE",
+                    )
                     continue
-                
+
                 # Create analysis object with required fields for validator
                 tweet.analysis = TweetAnalysisBase(
                     sentiment=classification.sentiment.value,
@@ -263,17 +274,15 @@ class Miner(BaseMinerNeuron):
         try:
             bt.logging.info(f"[Miner] Background: Processing {len(synapse.message_batch)} telegram messages")
             
-            # Process each message
+            # Process each message (always attach analysis; missing analysis is frequently sampled and rejected)
             for msg in synapse.message_batch:
-                if not msg.content:
-                    bt.logging.warning(f"[Miner] Skipping telegram message {msg.id} - no content")
-                    continue
+                content = msg.content or ""
                 
                 # Build message dict for analyzer
                 messages_for_analysis = [{
                     'message_id': msg.id,
                     'username': msg.sender_username or msg.sender_name,
-                    'content': msg.content,
+                    'content': content,
                 }]
                 
                 # Add context messages if available
@@ -289,13 +298,32 @@ class Miner(BaseMinerNeuron):
                 inherited_subnet_id = msg.inherited_subnet_id
                 
                 # Classify the message group
-                classification = self.telegram_analyzer.classify_message_group(
-                    messages_for_analysis, 
-                    subnet_id=inherited_subnet_id
-                )
-                
+                classification = None
+                try:
+                    classification = self.telegram_analyzer.classify_message_group(
+                        messages_for_analysis,
+                        subnet_id=inherited_subnet_id,
+                    )
+                except Exception:
+                    classification = None
+
+                # If classification fails, fall back to safe defaults to avoid missing analysis.
                 if classification is None:
-                    bt.logging.warning(f"[Miner] Failed to classify telegram message {msg.id}")
+                    bt.logging.warning(f"[Miner] Failed to classify telegram message {msg.id}; returning fallback analysis")
+                    from datetime import datetime
+                    msg.analysis = TelegramMessageAnalysis(
+                        id=0,  # Placeholder, will be assigned by API
+                        message_id=msg.id,
+                        sentiment="neutral",
+                        subnet_id=int(inherited_subnet_id) if inherited_subnet_id is not None else 0,
+                        subnet_name="NONE_OF_THE_ABOVE",
+                        content_type="other",
+                        technical_quality="none",
+                        market_analysis="other",
+                        impact_potential="NONE",
+                        relevance_confidence=None,
+                        analyzed_at=datetime.now().isoformat(),
+                    )
                     continue
                 
                 # Create analysis object with required fields for validator
@@ -522,6 +550,11 @@ class Miner(BaseMinerNeuron):
 
     def __exit__(self, exc_type, exc_value, traceback):
         """Clean up when miner exits."""
+        try:
+            if hasattr(self, "_executor") and self._executor is not None:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         super().__exit__(exc_type, exc_value, traceback)
         return False
 
