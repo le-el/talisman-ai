@@ -54,6 +54,10 @@ class Miner(BaseMinerNeuron):
             max(1, max_workers),
             int(getattr(talisman_ai.config, "MINER_MAX_PENDING_TASKS", max_workers * 16)),
         )
+        self._enqueue_timeout_seconds = max(
+            0.0,
+            float(getattr(talisman_ai.config, "MINER_ENQUEUE_TIMEOUT_SECONDS", 5.0)),
+        )
         self._cache_enabled = str(getattr(talisman_ai.config, "MINER_CACHE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
         self._cache_ttl_seconds = float(getattr(talisman_ai.config, "MINER_CACHE_TTL_SECONDS", 1800.0))
         self._cache_max_items = max(1, int(getattr(talisman_ai.config, "MINER_CACHE_MAX_ITEMS", 10000)))
@@ -643,6 +647,31 @@ class Miner(BaseMinerNeuron):
         except Exception as e:
             bt.logging.error(f"[Miner] Background task failed: {e}")
 
+    async def _submit_background_task_async(
+        self,
+        fn: typing.Callable,
+        *args,
+        timeout_seconds: float,
+        kind_label: str,
+        validator_hotkey: str,
+    ) -> bool:
+        if self._submit_background_task(fn, *args):
+            return True
+
+        deadline = time.time() + max(0.0, timeout_seconds)
+        warned = False
+        while time.time() < deadline:
+            await asyncio.sleep(0.05)
+            if self._submit_background_task(fn, *args):
+                return True
+            if not warned:
+                bt.logging.warning(
+                    f"[Miner] Background queue saturated ({self._max_pending_tasks}); "
+                    f"waiting for slot kind={kind_label} validator={validator_hotkey[:12]}.."
+                )
+                warned = True
+        return False
+
     def _maybe_log_cache_stats(self) -> None:
         if not self._cache_enabled:
             return
@@ -748,14 +777,21 @@ class Miner(BaseMinerNeuron):
         synapse_copy = copy.deepcopy(synapse)
         
         # Process asynchronously in a bounded worker pool.
-        submitted = self._submit_background_task(self._process_and_send_tweets, synapse_copy, validator_hotkey)
+        submitted = await self._submit_background_task_async(
+            self._process_and_send_tweets,
+            synapse_copy,
+            validator_hotkey,
+            timeout_seconds=self._enqueue_timeout_seconds,
+            kind_label="Tweet",
+            validator_hotkey=validator_hotkey,
+        )
         if not submitted:
-            bt.logging.warning(
-                f"[Miner] Background queue full ({self._max_pending_tasks}); "
-                f"dropping TweetBatch from validator {validator_hotkey[:12]}.."
+            bt.logging.error(
+                f"[Miner] Background queue remained full ({self._max_pending_tasks}) "
+                f"after {self._enqueue_timeout_seconds:.1f}s; refusing TweetBatch from validator {validator_hotkey[:12]}.."
             )
             self._maybe_log_cache_stats()
-            return synapse
+            raise RuntimeError("miner background queue saturated for TweetBatch")
         
         bt.logging.info(f"[Miner] Started background processing for TweetBatch, returning immediately")
         return synapse
@@ -784,14 +820,21 @@ class Miner(BaseMinerNeuron):
         synapse_copy = copy.deepcopy(synapse)
         
         # Process asynchronously in a bounded worker pool.
-        submitted = self._submit_background_task(self._process_and_send_telegram_messages, synapse_copy, validator_hotkey)
+        submitted = await self._submit_background_task_async(
+            self._process_and_send_telegram_messages,
+            synapse_copy,
+            validator_hotkey,
+            timeout_seconds=self._enqueue_timeout_seconds,
+            kind_label="Telegram",
+            validator_hotkey=validator_hotkey,
+        )
         if not submitted:
-            bt.logging.warning(
-                f"[Miner] Background queue full ({self._max_pending_tasks}); "
-                f"dropping TelegramBatch from validator {validator_hotkey[:12]}.."
+            bt.logging.error(
+                f"[Miner] Background queue remained full ({self._max_pending_tasks}) "
+                f"after {self._enqueue_timeout_seconds:.1f}s; refusing TelegramBatch from validator {validator_hotkey[:12]}.."
             )
             self._maybe_log_cache_stats()
-            return synapse
+            raise RuntimeError("miner background queue saturated for TelegramBatch")
         
         bt.logging.info(f"[Miner] Started background processing for TelegramBatch, returning immediately")
         return synapse

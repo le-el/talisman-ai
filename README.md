@@ -178,7 +178,7 @@ Copy `.vali_env_tmpl` to `.vali_env` and configure the following variables:
 ## 🪬 Running on Mainnet
 
 **Run Miner**
-pm2 start python3 --name 2talisman -- -m neurons.miner --netuid 45 --wallet.name miner --wallet.hotkey trishool --logging.info --axon.port 8092 --axon.external_port 8092
+pm2 start python3 --name talisman2 -- -m neurons.miner --netuid 45 --wallet.name miner --wallet.hotkey hotkey2 --logging.info --axon.port 8093 --axon.external_port 8093
 
 
 ```bash
